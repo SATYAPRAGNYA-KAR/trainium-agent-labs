@@ -47,6 +47,10 @@ from collections import defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 FLAG_MAP = {                       # `+name` in an arm  ->  rl_trace_agent.py flags
     "no-analysis": ["--no-analysis"],
+    "no-docs": ["--no-docs"],
+    "no-lang-lint": ["--no-lang-lint"],
+    "no-repair-mix": ["--repair-mix", "0"],
+    "model-card": ["--model-card"],
     "no-variants": ["--no-variants"],
     "no-escalate": ["--no-escalate"],
     "no-restart": ["--no-plain-restart"],

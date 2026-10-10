@@ -160,7 +160,7 @@ earlier numbers are in [README.md](README.md) ("One run is not a result"). Logs:
 | Level | Operation | Episodes solved | Wilson 95% | Best reward per episode | Samples generated |
 |---|---|---|---|---|---|
 | 1 | average pooling 2D | **0 / 5** | [0.00, 0.43] | 0.30, 0.30, 0.30, 0.30, 0.30 | 18, 18, 21, 18, 22 = 97 |
-| 2 | transpose | **5 / 5** | [0.38, 0.67] | 1.00, 1.00, 1.00, 1.00, 1.00 | ****** |
+| 2 | transpose | not run here | | | |
 | 3 | matmul, single tile | **4 / 5** | [0.38, 0.96] | 1.00, 1.00, 1.00, 1.00, 0.30 | 15, 14, 21, 4, 20 = 74 |
 | 4 | matmul, tiled | **0 / 3 complete** † | [0.00, 0.56] | 0.30, 0.30, 0.30, then 0.62 (ep 4, partial) | 19, 23, 21, ... |
 
@@ -248,6 +248,86 @@ ceiling for this model across README runs, `agent.py`, and now `reflect/shape`.
   episode run can resolve; intervals are wide everywhere.
 - **Not shown:** whether `shape` hints help at all (no `none` or `api` arm in this run), and whether the
   analysis or the variants matter (no ablation arm). This table is one arm.
+
+## v7: failure analysis and level-agnostic changes
+
+Written after the level 1/3/4 run above. Nothing here is specific to a level, an operation, or a shape;
+`tile_lint.py` and the prompt card contain no pooling, transpose or matmul vocabulary (a test enforces it
+for the card). **None of this has been run against the model yet.** It passes 79 offline tests (64 old, 15
+new) and the shipped reference kernels lint clean. Whether it raises any solve rate is what the A/B below
+measures.
+
+### What the traces say, independent of level
+
+| # | Observation (from the logs above) | Root cause | v7 change |
+|---|---|---|---|
+| 1 | Level 4 ep 1 and 2: `NameError: name 'n'` then `TypeError: ... 'NkiTensor' * 'NkiTensor'` on the same line, round after round. Level 3 ep 5: `tensor_copy` into `shared_hbm`, found a round after another error. | The simulator stops at the first violation, so the model learns one language rule per round and has 3 to 4 rounds. | `tile_lint.lint_tile_model` reads the code and reports **every** violation at once: undefined names, Python operators between tiles, tiles passed to an op that needs another memory. |
+| 2 | Level 1 `nisa.divide` (exists as `nl.divide`); level 4 `nl.ceil_div`, `dst_idx=`. The "closest names" offered for `divide` were `dge_mode, nc_find_index8, activate2`. | Spelling-only suggestions across one module. | `sibling_hint`: the same name in the other nki module, then close spellings, plus a note that size arithmetic is plain Python. |
+| 3 | Level 1: `axis=(2, 4)` then `axis=(2, 3)` then `axis=(2, 4)`; the same family in every episode. | The error says what is wrong, not what the call does. | `call_docs`: the real signature and docstring of the call on the failing line, taken from the installed SDK at failure time. |
+| 4 | Level 3: 0/20 repair samples solved, 5/20 post-restart samples did. Level 4 ep 4: the 0.62 kernel was reproduced unchanged in 3 repair samples. | A repair prompt contains the failing code and the model copies it. A restart waited for two identical failures. | `--repair-mix 0.5`: in every repair round half the samples (at least one, never sample 0) are asked fresh, with the same grounded analysis. Rows log `prompt_kind`. |
+| 5 | Level 3 `Held-out shapes: 0/0` on every verified kernel. | The reference asserts one exact shape, so every held-out shape is excluded and the check is vacuous. | The VERIFIED line now says so ("NONE USABLE ... checker's shapes only"). The check itself is unchanged. |
+
+### Files
+
+| File | Status |
+|---|---|
+| `tile_lint.py` | **new**: undefined names, tile operators, buffer kinds, sibling-module hints, SDK docs for a call |
+| `test_tile_lint.py` | **new**: 15 tests, including "every `reference_level*.py` lints clean" |
+| `rl_trace_agent.py` | edited: wires the above in, `--repair-mix`, `--model-card`, `--no-docs`, `--no-lang-lint`, schema 8 |
+| `summarize_rl_trace.py` | edited: "Solves by prompt kind" table and a count of failures with a language finding |
+| `run_matrix.py` | edited: arm flags `+no-docs`, `+no-lang-lint`, `+no-repair-mix`, `+model-card` |
+
+### Design rules kept from earlier findings
+
+- **Feedback side, not prompt side.** Items 1 to 3 touch only the text attached to a kernel that already
+  failed. The README records an earlier prompt addition that made every level worse, so the one change that
+  adds text to **every** prompt, the TILE MODEL card, is off by default (`--model-card`) and is its own arm.
+- **No hint carries an answer.** The checks say where and why (line, memory, signature); they do not give a
+  replacement kernel. The level 1 `.ap()` view is **not** mentioned anywhere: if the SDK docstring for the
+  failing call mentions it, the model sees it, otherwise it does not.
+- **The buffer rules are the checker's own.** `BUFFER_RULES` holds exactly the constraints the checker
+  printed in the traces (`tensor_copy`, `nc_matmul`). Extend it only from verifier messages.
+- **Advisory.** Findings are attached only to failures, are logged in `lang_lint`, and a kernel that passes
+  is never penalised. `lint_clean` now also counts them in the shaped reward, the same as `lint_api`.
+
+### Run the A/B
+
+Same levels, same seeds, one factor per arm. 10 episodes per arm is the minimum that separates 4/5 from 2/5
+at all; the earlier 5-episode intervals were [0.38, 0.96] for the best level.
+
+```bash
+python run_matrix.py --levels 1 3 4 --episodes 10 \
+    --arms reflect/shape+no-lang-lint+no-docs+no-repair-mix \
+           reflect/shape \
+           reflect/shape+no-repair-mix \
+           reflect/shape+no-docs \
+           reflect/shape+model-card \
+    -- --context 8192 --no-seed --same-temp
+python summarize_rl_trace.py matrix_runs/*.jsonl --brief
+```
+
+The first arm approximates v6 (the sibling-module hint inside `lint_api` has no switch, so it is not an
+exact v6). The second is the v7 default. Arms 3 and 4 remove one change each; arm 5 adds the card. Read
+`Solves by prompt kind` before the arm table: it is the direct test of finding 4.
+
+### Limitations of v7
+
+- **Untested against a model or the real SDK.** `call_docs` and `sibling_hint` are tested only against fake
+  `nki` modules; on the pod they use the real ones. If the real docstrings are empty or very long, `call_docs`
+  returns nothing or truncates to 700 characters. Check one failing row's `analysis` field first.
+- **`lint_tile_operators` is conservative and incomplete.** It flags tile-with-tile operators on names
+  bound to `nl.ndarray`-style allocations and on parameters the code reads `.shape` from. It does not follow
+  results of other calls, so `nl.sum(x) * nl.sum(y)` is not caught. It does not flag tile-with-scalar,
+  because the traces never showed whether that is legal.
+- **The undefined-name check is flow-insensitive.** A name bound anywhere counts as bound, so it misses a
+  use before assignment; it never flags a legal kernel.
+- **Repair-mix is supported by thin evidence**: repair [0.00, 0.16] against post-restart [0.11, 0.47] at
+  level 3 only, with duplicate rows counted. It may do nothing at levels where restarts did not help.
+- **It cannot give the model what it never sees.** If a level needs a construct the model does not know
+  and no docstring describes (level 1's strided view is the example), v7 reports the failure better but does
+  not supply the construct. That is the remaining gap, and it is deliberately not closed with a per-level hint.
+- Level 4's 0.62 ceiling (one 256-row tile instead of a loop) is not addressed by a specific rule. Nothing in
+  v7 tells the model to loop; the dma error message already does, and the model still did not.
 
 ## Limitations
 

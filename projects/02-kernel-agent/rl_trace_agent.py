@@ -41,8 +41,9 @@ import agent as base_agent
 import holdout as holdout_mod
 import kernel_lint
 import nkibench
+import tile_lint
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MODEL = os.environ.get("KERNEL_AGENT_MODEL", getattr(base_agent, "MODEL", "Qwen/Qwen3-8B"))
 
 STRATEGIES = ("direct", "contract_trace", "counterexample", "repair_diagnosis", "exemplar", "reflect")
@@ -100,6 +101,21 @@ SHAPES: the checker runs your kernel on SEVERAL input shapes, and some are small
 input. Read it from the tensor, e.g. `P, F = in_tensor.shape`, and allocate every tile with
 EXACTLY the shape of the data it receives. The 128 and 512 limits are maximums: when a dimension
 is smaller, use it whole.
+"""
+
+# What the checker enforces about the LANGUAGE, whatever the operation is. Every line is taken from a
+# message the checker printed in the level 1/3/4 traces. Opt-in (--model-card): an earlier prompt
+# addition made every level worse, so this is an arm to measure, not a default.
+TILE_MODEL_CARD = r"""
+TILE MODEL (enforced by the checker, whatever the operation is):
+- A tile is not a number: `a * b` and `a += b` between tiles raise TypeError. Combine tiles with nisa/nl ops.
+- Every sbuf/psum tile has at least 2 dimensions; the first is the partition dimension, at most 128.
+- A reduction (nl.sum, tensor_reduce) runs over the LAST dimensions of its input and keeps the first.
+- nisa.nc_matmul(dst=psum, stationary=sbuf, moving=sbuf) contracts over the first dimension of both;
+  calling it again on the same psum tile accumulates into it.
+- dma_copy moves hbm <-> sbuf, tensor_copy moves sbuf <-> psum. Neither resizes: both sides hold the
+  same number of elements.
+- Sizes and indices are plain Python ints: use //, %, min, max. There are no nl helpers for them.
 """
 
 LEVEL2_ALGO_HINT = r"""
@@ -409,7 +425,8 @@ def lint_api(code):
                     names = base_agent.available_names(full)
                 except Exception:
                     names = ""
-                add(node, f"`{ast.unparse(node)}` does not exist.{names}")
+                where = tile_lint.sibling_hint(full)
+                add(node, f"`{ast.unparse(node)}` does not exist." + (f" {where}" if where else "") + names)
         if isinstance(node, ast.Call):
             written = _dotted_name(node.func)
             full = _resolve(written, alias)
@@ -780,13 +797,15 @@ def _shape_pattern(cases):
     return text
 
 
-def located_analysis(level, code, probe, reveal_flow=True, all_shapes=True):
+def located_analysis(level, code, probe, reveal_flow=True, all_shapes=True, docs=True):
     parts = []
     if probe["kind"] == "exception":
         where = f"line {probe['lineno']}: `{probe['src']}`" if probe["lineno"] else "inside the kernel"
         parts.append(f"LOCATION: {probe['etype']} is raised at {where}: {compact(probe['msg'], 200)}")
         if level == 2 and reveal_flow:
             parts.append(_oob_analysis(probe["msg"], probe["case"].get("shape2D")))
+        if docs:                                         # what the SDK says the failing call does
+            parts.append(compact(tile_lint.call_docs(code, probe["lineno"]), 700))
     elif probe["kind"] == "mismatch" and level == 2 and reveal_flow:
         args = probe["args"]
         parts.append(explain_permutation(probe["got"], args[0], args[1]))
@@ -852,7 +871,7 @@ def facts_block(facts):
 
 def build_prompt(args, level, action, anchor_code="", anchor_feedback="", last_feedback="",
                  last_regressed=False, history=(), exemplar=None, stuck=False, diagnosis="",
-                 diag_src="", lessons=(), facts=(), rejected=(), hints=None):
+                 diag_src="", lessons=(), facts=(), rejected=(), hints=None, fresh=False):
     hints = hints or args.hints
     if args.mode == "plain":                       # exactly what agent.py would send
         if stuck and getattr(args, "plain_restart", True):
@@ -864,7 +883,7 @@ def build_prompt(args, level, action, anchor_code="", anchor_feedback="", last_f
         return base_agent.first_prompt(level, args.terse)
 
     spec = nkibench.LEVELS[level]
-    if anchor_code and not stuck:
+    if anchor_code and not stuck and not fresh:
         core = base_agent.repair_prompt(level, anchor_code, anchor_feedback)
         if last_regressed and last_feedback:
             core += ("\n\nA LATER attempt made things worse and was discarded; do not do this: "
@@ -900,6 +919,8 @@ def build_prompt(args, level, action, anchor_code="", anchor_feedback="", last_f
         cards += SHAPE_RULE_CARD
     if tier >= 3 and level == 2:
         cards += LEVEL2_ALGO_HINT
+    if getattr(args, "model_card", False):
+        cards += TILE_MODEL_CARD
     return (
         core + "\n\n" + cards + "\n" + facts_block(facts) + lessons_block(lessons) +
         exemplar_block + diagnosis_block + "\n" + strategy_instructions(action, history) + "\n" +
@@ -1259,7 +1280,7 @@ def run_episode(run, level, episode, run_id):
     spec = nkibench.LEVELS[level]
     plain = args.mode == "plain"
     analysis_on = not plain and not getattr(args, "no_analysis", False)
-    print(f"\n========== RL trace agent v6 [{args.mode}, hints={args.hints}]: level {level} "
+    print(f"\n========== RL trace agent v7 [{args.mode}, hints={args.hints}]: level {level} "
           f"({spec['op']}) episode {episode + 1}/{args.episodes} ==========")
     if getattr(args, "independent_episodes", False):
         # Without this, episode k starts with what episodes 0..k-1 learned, so per-episode solve
@@ -1282,7 +1303,11 @@ def run_episode(run, level, episode, run_id):
                   escalate=bool(getattr(args, "escalate", True)), flow=not args.no_flow,
                   probe_all=getattr(args, "probe_all", True), trace=bool(args.trace),
                   holdout=getattr(args, "holdout", "report"),
-                  independent=bool(getattr(args, "independent_episodes", False)))
+                  independent=bool(getattr(args, "independent_episodes", False)),
+                  repair_mix=float(getattr(args, "repair_mix", 0.0)),
+                  model_card=bool(getattr(args, "model_card", False)),
+                  docs=not getattr(args, "no_docs", False),
+                  lang_lint=not getattr(args, "no_lang_lint", False))
 
     for round_i in range(args.rounds):
         context = f"level={level}|failure={last['category']}"
@@ -1341,6 +1366,22 @@ def run_episode(run, level, episode, run_id):
         seeds = [(args.seed * 1000003 + episode * 10007 + round_i * 101 + i) % (2 ** 31)
                  for i in range(n)]
         prompts = sample_prompts(prompt, n, not args.no_variants and not plain)
+        # Repair vs fresh. A repair prompt carries the failing code and the model copies it; in the
+        # level 3 trace 0 of 20 repair samples solved and 5 of 20 post-restart (fresh) samples did.
+        # So part of a repair round is asked fresh, with the same grounded analysis. Sample 0 always
+        # keeps the canonical prompt.
+        repairing = (not plain) and bool(anchor["code"].strip()) and not stuck
+        kinds = ["restart" if stuck else ("repair" if repairing else "first")] * n
+        mix = float(getattr(args, "repair_mix", 0.0))
+        if repairing and mix > 0 and n > 1:
+            k = max(1, min(n - 1, round(n * mix)))
+            fresh_prompt = build_prompt(args, level, prompt_action, anchor["code"], anchor["feedback"],
+                                        last["feedback"], last["regressed"], history, exemplar, False,
+                                        diagnosis, diag_src, lessons, facts, rejected,
+                                        hints=hints_now, fresh=True)
+            fresh_prompts = sample_prompts(fresh_prompt, n, not args.no_variants)
+            for i in range(n - k, n):
+                prompts[i], kinds[i] = fresh_prompts[i], "fresh"
         replies, wall = generate(args, prompts, temps, seeds)
         samples_used += n
 
@@ -1386,9 +1427,11 @@ def run_episode(run, level, episode, run_id):
             (kernel, parts, feedback), cached = run.grade(level, code, fp)
             passed = bool(parts.get("correct"))
             category = classify_feedback(feedback, passed, truncated)
-            lint, hard = [], []
+            lint, hard, lang = [], [], []
             if analysis_on and not passed and code.strip():
                 lint = lint_api(code)
+                if not getattr(args, "no_lang_lint", False):
+                    lang = tile_lint.lint_tile_model(code)
             if not passed and not plain:
                 feedback = enrich_feedback(feedback, category, dropped, code)
                 if analysis_on and category == "tile_limits":
@@ -1398,13 +1441,15 @@ def run_episode(run, level, episode, run_id):
                     feedback = (feedback + " " + format_lint(lint)).strip()
                 if hard:
                     feedback = (feedback + " " + kernel_lint.format_hardcoded(hard)).strip()
+                if lang:
+                    feedback = (feedback + " " + tile_lint.format_findings(lang)).strip()
             repeated = bool(fp) and (fp in seen or fps.index(fp) != i)
             hygiene = 1.0 if (parts.get("parses") and not dropped and not truncated) else 0.0
             results.append(dict(
                 reply=reply, finish=finish, truncated=truncated, trace=trace, trace_valid=trace_valid,
                 raw_code=raw_code, code=code, dropped=dropped, kernel=float(kernel), parts=parts,
                 feedback=feedback, category=category, fingerprint=fp, repeated=repeated,
-                hygiene=hygiene, lint=lint, hard=hard, cached=cached, passed=passed,
+                hygiene=hygiene, lint=lint, hard=hard, lang=lang, kind=kinds[i], cached=cached, passed=passed,
                 temperature=temps[i], prompt=prompts[i], analysis="", probe=None, holdout=None,
                 progress=0.0))
 
@@ -1439,7 +1484,7 @@ def run_episode(run, level, episode, run_id):
             r["improved"] = 1.0 if r["kernel"] > best["kernel"] + 1e-9 else 0.0
             r["trace_reward"], r["trace_parts"] = trace_score(r["trace"], level, r["trace_valid"])
             r["rl"] = shaped_reward(r["kernel"], r["trace_reward"], r["progress"],
-                                    0.0 if (r["lint"] or r["hard"]) else 1.0, r["hygiene"],
+                                    0.0 if (r["lint"] or r["hard"] or r["lang"]) else 1.0, r["hygiene"],
                                     r["improved"], args.trace)
         raw_adv, norm_adv, dup = dedup_advantages([r["rl"] for r in results],
                                                   [r["fingerprint"] for r in results])
@@ -1449,18 +1494,20 @@ def run_episode(run, level, episode, run_id):
         if analysis_on and not top["passed"] and top["kernel"] > 0 \
                 and top["category"] in LOCATABLE:
             probe = top["probe"] or run.probe(level, top["code"], top["fingerprint"])
-            located = located_analysis(level, top["code"], probe, REVEAL_FLOW and not args.no_flow)
+            located = located_analysis(level, top["code"], probe, REVEAL_FLOW and not args.no_flow,
+                                       docs=not getattr(args, "no_docs", False))
             parts_ = [p for p in (format_lint(top["lint"]), kernel_lint.format_hardcoded(top["hard"]),
-                                  located) if p]
+                                  tile_lint.format_findings(top["lang"]), located) if p]
             top["analysis"] = " ".join(parts_)
             if located:
                 fb = top["feedback"]
                 if "This is NOT a tile-size limit" in located and " You indexed up to " in fb:
                     fb = fb.split(" You indexed up to ")[0]       # generic advice that misleads here
                 top["feedback"] = (fb + " " + located).strip()
-        elif analysis_on and (top["lint"] or top["hard"]) and not top["analysis"]:
+        elif analysis_on and (top["lint"] or top["hard"] or top["lang"]) and not top["analysis"]:
             top["analysis"] = " ".join(p for p in (format_lint(top["lint"]),
-                                                   kernel_lint.format_hardcoded(top["hard"])) if p)
+                                                   kernel_lint.format_hardcoded(top["hard"]),
+                                                   tile_lint.format_findings(top["lang"])) if p)
 
         for i, r in enumerate(results):
             if not dup[i]:                                   # a duplicate is not a new observation
@@ -1468,6 +1515,9 @@ def run_episode(run, level, episode, run_id):
                 run.temperature.update(context, temp_name, r["rl"])
             for issue in r["lint"]:
                 state.note_fact(issue["sig"])
+                if issue["src"] and issue["src"] not in rejected:
+                    rejected.append(issue["src"])
+            for issue in r["lang"]:
                 if issue["src"] and issue["src"] not in rejected:
                     rejected.append(issue["src"])
             hold = r["holdout"] or {}
@@ -1480,8 +1530,9 @@ def run_episode(run, level, episode, run_id):
                 "restarts": restarts, "escalation": escalation, "duplicate": dup[i],
                 "diagnosis": diagnosis, "diagnosis_source": diag_src, "lesson": rule,
                 "kernel_reward": r["kernel"], "trace_reward": r["trace_reward"],
-                "progress": r["progress"], "lint_clean": not (r["lint"] or r["hard"]),
-                "lint": r["lint"], "shape_lint": r["hard"],
+                "progress": r["progress"], "lint_clean": not (r["lint"] or r["hard"] or r["lang"]),
+                "lint": r["lint"], "shape_lint": r["hard"], "lang_lint": r["lang"],
+                "prompt_kind": r["kind"],
                 "probe_cases": (r["probe"] or {}).get("details"),
                 "holdout": ({"passed": hold.get("passed"), "total": hold.get("total"),
                              "ok": hold.get("ok"), "available": hold.get("available")}
@@ -1506,6 +1557,8 @@ def run_episode(run, level, episode, run_id):
             flags = "".join([" REPEAT" if r["repeated"] else "", " DUP" if dup[i] else "",
                              " CUT" if r["truncated"] else "",
                              " STUCK-RESTART" if was_stuck else "",
+                             " FRESH" if r["kind"] == "fresh" else "",
+                             " LANG" if r["lang"] else "",
                              " LINT" if r["lint"] else "", " HARDCODED" if r["hard"] else "",
                              " cached" if r["cached"] else "",
                              f" stripped={len(r['dropped'])}" if r["dropped"] else ""])
@@ -1569,6 +1622,9 @@ def run_episode(run, level, episode, run_id):
             extra = ""
             if hold.get("available"):
                 extra = f" Held-out shapes: {hold['passed']}/{hold['total']}."
+                if not hold.get("total"):
+                    extra += (" NONE USABLE (the shipped reference fails every held-out shape), so this "
+                              "verdict covers the checker's shapes only.")
             print("  VERIFIED: every checker shape passed." + extra)
             break
 
@@ -1648,6 +1704,16 @@ def main():
     parser.add_argument("--no-analysis", action="store_true",
                         help="skip lint, probe and located analysis: the model sees only the "
                              "verifier's own text (an ablation of everything computed here)")
+    parser.add_argument("--repair-mix", type=float, default=0.5,
+                        help="fraction of a repair round asked with a fresh prompt + the grounded analysis "
+                             "instead of the failing code (0 = v6 behaviour, all repair)")
+    parser.add_argument("--model-card", action="store_true",
+                        help="add the TILE MODEL card (language rules the checker enforces) to every prompt")
+    parser.add_argument("--no-docs", action="store_true",
+                        help="do not attach the SDK docstring of the call that failed")
+    parser.add_argument("--no-lang-lint", action="store_true",
+                        help="do not attach the language-level static findings (undefined names, tile "
+                             "operators, buffer kinds)")
     parser.add_argument("--no-probe-all", dest="probe_all", action="store_false",
                         help="probe only the best failing sample of a round, not every failing one")
     parser.add_argument("--holdout", choices=("off", "report", "require"), default="report",

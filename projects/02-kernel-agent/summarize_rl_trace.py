@@ -350,6 +350,23 @@ def main():
                       f"on an escalated hint tier: "
                       f"{sum(1 for r in later if r.get('hints_effective') not in (None, r.get('hints')))}")
 
+        kinds = [r for r in rows if r.get("prompt_kind")]
+        if kinds:
+            print("\nSolves by prompt kind (v8 rows; first = round 0, repair = failing code in the "
+                  "prompt, fresh = analysis only, restart = fresh after a stuck round):")
+            seen_fp = set()
+            for kind in ("first", "repair", "fresh", "restart"):
+                rs = [r for r in kinds if r["prompt_kind"] == kind
+                      and (r["episode"], r["round"], r.get("fingerprint", id(r))) not in seen_fp]
+                if not rs:
+                    continue
+                ok = sum(1 for r in rs if float(r["kernel_reward"]) >= SOLVED)
+                lo, hi = wilson(ok, len(rs))
+                print(f"  {kind:8s} {ok:3d}/{len(rs):3d} samples solved  {fmt_ci(lo, hi)}")
+            lang = [r for r in kinds if r.get("lang_lint")]
+            print(f"  failing samples with a language-level finding: {len(lang)}/"
+                  f"{sum(1 for r in kinds if float(r['kernel_reward']) < SOLVED)}")
+
         holds = [r for r in rows if float(r["kernel_reward"]) >= SOLVED and r.get("holdout")
                  and r["holdout"].get("available")]
         if holds:
