@@ -365,3 +365,8 @@ exact v6). The second is the v7 default. Arms 3 and 4 remove one change each; ar
 4. Rejection-sampling fine-tune on `--export-sft` rows once the solve rate is nonzero.
 5. Flow checks for levels 1, 3 and 4 (trace each output back to its source for data movement; a per-tile
    error map for matmul). Only level 2 has one.
+
+python run_matrix.py --levels 1 2 3 4 --episodes 10 \
+    --arms reflect/shape+no-lang-lint+no-docs+no-repair-mix reflect/shape \
+           reflect/shape+no-repair-mix reflect/shape+no-docs reflect/shape+model-card \
+    -- --context 8192 --no-seed --same-temp
